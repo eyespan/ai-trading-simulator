@@ -27,9 +27,12 @@ keeps three layers independent, in a strict pipeline:
 2. **AI review (`app/core/ai_reviewer.py`)** — Claude reviews the *already
    generated* signal (it does not invent a new one) and returns a plain-English
    rationale, a confidence score, and risk flags — the way a second pair of
-   eyes on a desk would sanity-check a model's output. If no API key is
-   configured, or the call fails, this falls back to a deterministic
-   rule-based explanation so the app is always fully runnable.
+   eyes on a desk would sanity-check a model's output. Supports either the
+   direct Anthropic API or AWS Bedrock, selected via `AI_PROVIDER` (see
+   [AI provider setup](#ai-provider-setup)). If no credentials are
+   configured for the selected provider, or the call fails, this falls back
+   to a deterministic rule-based explanation so the app is always fully
+   runnable either way.
 3. **Risk gate (`app/core/risk.py`)** — independent of both of the above.
    Enforces max position size, per-trade risk (stop-loss-based sizing),
    a portfolio drawdown circuit breaker, and a max open-positions limit.
@@ -51,21 +54,51 @@ keeps three layers independent, in a strict pipeline:
 
 ## Running it
 
+**Note** this was specifcally tested on **Python 3.13.13**
+
 ```bash
 cd backend
 python -m venv venv && source venv/bin/activate   # or your preferred env tool
 pip install -r requirements.txt
 
-cp .env.example .env   # optional: add ANTHROPIC_API_KEY for live AI review
+cp .env.example .env   # optional: configure an AI provider, see below
 
 uvicorn app.main:app --reload
 ```
 
 Then open `http://localhost:8000`.
 
-The app runs fully offline / without any API key — the AI review layer
-degrades gracefully to a deterministic rule-based explanation if
-`ANTHROPIC_API_KEY` isn't set.
+The app runs fully offline / without any AI credentials at all — the AI
+review layer degrades gracefully to a deterministic rule-based explanation
+if no provider is configured or a live call fails.
+
+### AI provider setup
+
+Set `AI_PROVIDER` in `.env` to choose how the review layer talks to Claude:
+
+**Direct Anthropic API** (`AI_PROVIDER=anthropic`, the default)
+```
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+**AWS Bedrock** (`AI_PROVIDER=bedrock`) — uses your existing AWS credentials
+(env vars, `~/.aws/credentials`, SSO, or an instance/task role), no
+Anthropic API key needed:
+```
+AI_PROVIDER=bedrock
+AWS_REGION=us-east-1
+AWS_SDK_LOAD_CONFIG=1
+# credentials via env vars, aws configure, or an assumed role -- whatever
+# you already use for AWS CLI/SDK access
+BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0   # verify this against
+                                                      # Bedrock > Model access
+                                                      # for your account/region
+```
+
+If you're already authenticated to AWS locally (e.g. via `aws sso login` or
+exported credentials), you generally only need to set `AI_PROVIDER=bedrock`
+and `AWS_REGION` — boto3 picks up the rest automatically.
 
 ### Running tests
 
