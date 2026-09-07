@@ -87,6 +87,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 Anthropic API key needed:
 ```
 AI_PROVIDER=bedrock
+AWS_PROFILE=your-aws-profile-name
 AWS_REGION=us-east-1
 AWS_SDK_LOAD_CONFIG=1
 # credentials via env vars, aws configure, or an assumed role -- whatever
@@ -96,9 +97,15 @@ BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0   # verify this ag
                                                       # for your account/region
 ```
 
-If you're already authenticated to AWS locally (e.g. via `aws sso login` or
-exported credentials), you generally only need to set `AI_PROVIDER=bedrock`
-and `AWS_REGION` — boto3 picks up the rest automatically.
+If you're already authenticated to AWS locally, you generally only need
+`AI_PROVIDER=bedrock`, `AWS_REGION`, and `AWS_PROFILE` — the app resolves
+credentials via `boto3.Session(profile_name=...)` at startup, the same way
+the AWS CLI would.
+
+Note: credentials are resolved once at startup, not refreshed per-request.
+If you're using short-lived SSO credentials and the app has been running for
+a long time, restart it to pick up a fresh session.
+
 
 ### Running tests
 

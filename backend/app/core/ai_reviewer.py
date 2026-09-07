@@ -9,9 +9,12 @@ could go wrong?) the way a second pair of eyes on a trading desk would.
 
 Supports two providers, selected via the AI_PROVIDER env var:
   - "anthropic" (default): direct Anthropic API, needs ANTHROPIC_API_KEY
-  - "bedrock": AWS Bedrock, using your normal AWS credential chain
-    (env vars, ~/.aws/credentials, instance/task role, SSO, etc.) — no
-    Anthropic API key needed
+  - "bedrock": AWS Bedrock. Credentials are resolved explicitly via a
+    boto3.Session (supporting AWS_PROFILE, including SSO/assume-role
+    profiles defined in ~/.aws/config -- set AWS_SDK_LOAD_CONFIG=1 for
+    those to be read at all) rather than left to the Anthropic SDK's
+    internal lazy resolution, so failures are visible and debuggable
+    instead of silently falling back.
 
 If no credentials are available for the selected provider, or the live call
 fails for any reason, falls back to a deterministic rule-based explanation
@@ -20,10 +23,8 @@ so the app is fully runnable out of the box either way.
 from __future__ import annotations
 
 import json
+import logging
 import os
-import sys
-import traceback
-
 from dataclasses import dataclass
 
 from app.core.indicators import QuantSignal
@@ -33,12 +34,14 @@ try:
 except ImportError:  # pragma: no cover
     anthropic = None
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6"
-# Bedrock model IDs are region/account-specific and change as Anthropic ships
-# new versions — verify the exact ID available to you in the Bedrock console
-# (Model access page) and override via BEDROCK_MODEL_ID if this default isn't
-# enabled for your account.
-DEFAULT_BEDROCK_MODEL_ID = "anthropic.claude-sonnet-4-6-v1:0"
+# Bedrock model IDs are region/account-specific and dated (not the same
+# naming as the direct API) -- verify the exact ID enabled for your account
+# under Bedrock > Model access, and override via BEDROCK_MODEL_ID if this
+# default isn't available to you.
+DEFAULT_BEDROCK_MODEL_ID = "anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 
 @dataclass
@@ -46,7 +49,7 @@ class AIReview:
     narrative: str
     confidence: float  # 0.0 - 1.0, AI's confidence in the quant signal
     risk_flags: list[str]
-    source: str  # "claude" or "rule_based_fallback"
+    source: str  # "claude_anthropic" / "claude_bedrock" / "rule_based_fallback"
 
 
 SYSTEM_PROMPT = """You are a risk-aware trading assistant reviewing an \
@@ -68,7 +71,22 @@ Lower confidence when indicators conflict, history is short, or volatility \
 is high. risk_flags should call out things a trader should watch for \
 (e.g. "signal conflicts with longer-term trend", "high volatility widens \
 stop distance", "single-indicator signal, weak confirmation"). Return only \
-the JSON object, nothing else."""
+the JSON object, nothing else, with no markdown code fences."""
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Claude occasionally wraps JSON replies in ```json ... ``` even when
+    told not to. Strip that before parsing rather than failing and falling
+    back on a response that was actually fine."""
+    text = text.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.split("\n")
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
 
 
 class AIReviewer:
@@ -84,52 +102,65 @@ class AIReviewer:
         self._client = None
 
         if anthropic is None:
-            print("⚠️ [AIReviewer] Anthropic SDK is not installed.", file=sys.stderr)
+            logger.warning("Anthropic SDK not installed; AI review will use the rule-based fallback.")
             return
 
         if self.provider == "bedrock":
-            self.model = self.model or os.environ.get("BEDROCK_MODEL_ID", DEFAULT_BEDROCK_MODEL_ID)
-            region = aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-
-             # Explicitly load via boto3 session to capture AWS_PROFILE accurately
-            import boto3
-            profile = os.environ.get("AWS_PROFILE")
-            
-            print(f"🔄 [AIReviewer] Initialising Bedrock client (Profile: {profile}, Region: {region}, Model: {self.model})...")
-
-            
-            try:
-                # AnthropicBedrock signs requests using boto3's normal
-                # credential chain — nothing to pass explicitly beyond region
-                # if you already have AWS credentials configured (env vars,
-                # ~/.aws/credentials, SSO, or an instance/task role).
-                session = boto3.Session(profile_name=profile, region_name=region)
-                creds = session.get_credentials()
-                
-                if not creds:
-                    print("⚠️ [AIReviewer] No credentials returned from boto3 session profile.", file=sys.stderr)
-                    return
-
-                self._client = anthropic.AnthropicBedrock(
-                    aws_access_key=creds.access_key,
-                    aws_secret_key=creds.secret_key,
-                    aws_session_token=creds.token,
-                    aws_region=region
-                )
-                print("✅ [AIReviewer] Bedrock SDK client generated successfully.")
-            except Exception as e:
-                print(f"❌ [AIReviewer] Bedrock Client Setup Error: {e}", file=sys.stderr)
-                traceback.print_exc()
-                self._client = None
-
+            self._init_bedrock(aws_region)
         elif self.provider == "anthropic":
-            api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-            self.model = self.model or os.environ.get("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL)
-            if api_key:
-                self._client = anthropic.Anthropic(api_key=api_key)
-                print(f"✅ [AIReviewer] Direct Anthropic client initialised using model {self.model}.")
+            self._init_anthropic(api_key)
         else:
             raise ValueError(f"Unknown AI_PROVIDER '{self.provider}': expected 'anthropic' or 'bedrock'.")
+
+    def _init_anthropic(self, api_key: str | None) -> None:
+        api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        self.model = self.model or os.environ.get("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL)
+        if api_key:
+            self._client = anthropic.Anthropic(api_key=api_key)
+            logger.info("AI reviewer: direct Anthropic client ready (model=%s).", self.model)
+        else:
+            logger.info("AI reviewer: no ANTHROPIC_API_KEY set; using rule-based fallback.")
+
+    def _init_bedrock(self, aws_region: str | None) -> None:
+        import boto3
+
+        self.model = self.model or os.environ.get("BEDROCK_MODEL_ID", DEFAULT_BEDROCK_MODEL_ID)
+        region = aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+        profile = os.environ.get("AWS_PROFILE")
+
+        logger.info("AI reviewer: initialising Bedrock client (profile=%s, region=%s, model=%s).",
+                    profile, region, self.model)
+
+        try:
+            # Resolve credentials explicitly via boto3.Session rather than
+            # letting the Anthropic SDK do it lazily -- this respects
+            # AWS_PROFILE (including SSO/assume-role profiles defined in
+            # ~/.aws/config, which requires AWS_SDK_LOAD_CONFIG=1 to be
+            # read at all) and surfaces credential problems immediately
+            # instead of an opaque failure on the first API call.
+            #
+            # Trade-off: this snapshots credentials at startup. For SSO or
+            # other short-lived session tokens, credentials can expire in a
+            # long-running process -- if you hit auth errors after the app
+            # has been up for hours, restart it to pick up a fresh session
+            # (or switch to long-lived IAM user keys / an instance role for
+            # anything that needs to stay up unattended).
+            session = boto3.Session(profile_name=profile, region_name=region)
+            creds = session.get_credentials()
+            if not creds:
+                logger.warning("AI reviewer: no AWS credentials resolved for profile=%s; using rule-based fallback.", profile)
+                return
+
+            self._client = anthropic.AnthropicBedrock(
+                aws_access_key=creds.access_key,
+                aws_secret_key=creds.secret_key,
+                aws_session_token=creds.token,
+                aws_region=region,
+            )
+            logger.info("AI reviewer: Bedrock client ready.")
+        except Exception:  # noqa: BLE001 - missing/invalid AWS setup falls back gracefully
+            logger.exception("AI reviewer: failed to initialise Bedrock client; using rule-based fallback.")
+            self._client = None
 
     @property
     def is_live(self) -> bool:
@@ -159,24 +190,8 @@ class AIReviewer:
             )
             text = "".join(
                 block.text for block in response.content if getattr(block, "type", None) == "text"
-            ).strip()
-            
-            # --- ADD THIS LINE TO DEBUG EMPTY OR WEIRD RESPONSES ---
-            print(f"🔍 [AIReviewer] Raw Model Response Text: {repr(text)}")
-
-            # --- ADD THIS CLEANUP SECTION TO STRIP MARKDOWN WRAPPERS ---
-            if text.startswith("```"):
-                # Strip leading ```json or ``` and trailing ```
-                lines = text.split("\n")
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].startswith("```"):
-                    lines = lines[:-1]
-                text = "\n".join(lines).strip()
-            # -----------------------------------------------------------
-
-            
-
+            )
+            text = _strip_markdown_fences(text)
             parsed = json.loads(text)
             return AIReview(
                 narrative=parsed["narrative"],
@@ -184,14 +199,13 @@ class AIReviewer:
                 risk_flags=list(parsed.get("risk_flags", [])),
                 source=f"claude_{self.provider}",
             )
-        except Exception as err:  # noqa: BLE001 - never let the AI layer crash the app
-            print(f"❌ [AIReviewer] Live Bedrock API Call Failed: {err}", file=sys.stderr)
-            traceback.print_exc()  # Prints full crash trace context to your server log terminal
+        except Exception:  # noqa: BLE001 - never let the AI layer crash the app
+            logger.exception("AI reviewer: live call failed for %s; using rule-based fallback.", symbol)
             return self._fallback_review(signal, degraded=True)
 
     @staticmethod
     def _fallback_review(signal: QuantSignal, degraded: bool = False) -> AIReview:
-        """Deterministic stand-in used when no API key is configured, or if
+        """Deterministic stand-in used when no provider is configured, or if
         the live call fails. Keeps the app fully functional offline."""
         confidence = 0.4 + min(abs(signal.score), 1.0) * 0.4
         risk_flags = []

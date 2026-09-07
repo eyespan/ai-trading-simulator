@@ -19,10 +19,34 @@ def test_anthropic_provider_without_key_falls_back_to_rule_based():
     assert 0.0 <= review.confidence <= 1.0
 
 
-def test_bedrock_provider_constructs_client_with_region():
+def test_bedrock_provider_constructs_client_with_resolved_credentials(tmp_path, monkeypatch):
+    creds_file = tmp_path / "credentials"
+    creds_file.write_text(
+        "[test-profile]\n"
+        "aws_access_key_id = AKIA_TEST_FAKE\n"
+        "aws_secret_access_key = test_secret\n"
+    )
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(creds_file))
+    monkeypatch.setenv("AWS_PROFILE", "test-profile")
+
     reviewer = AIReviewer(provider="bedrock", aws_region="us-east-1")
     assert reviewer.is_live is True
     assert reviewer.model  # a default model id is set
+
+
+def test_bedrock_provider_falls_back_without_resolvable_credentials(monkeypatch):
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/nonexistent/config")
+
+    reviewer = AIReviewer(provider="bedrock", aws_region="us-east-1")
+    assert reviewer.is_live is False
+
+    signal = QuantSignal(action=SignalAction.HOLD, score=0.0, reasons=["No signal."], indicators={})
+    review = reviewer.review("AAPL", signal, [100.0])
+    assert review.source == "rule_based_fallback"
 
 
 def test_unknown_provider_raises():
